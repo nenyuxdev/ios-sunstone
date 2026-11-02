@@ -17,6 +17,9 @@ on:
       gpu_blob_b64:
         description: "optional base64 of out/gpu-fw.blob from tools/gpu-build.sh; empty builds a software-rendering image"
         default: ""
+      kernel_run_id:
+        description: "reuse the xnu-kernel artifact of an earlier run instead of rebuilding the kernel"
+        default: ""
   push:
     branches: [sunstone]
     paths:
@@ -29,20 +32,31 @@ concurrency:
 
 jobs:
   kernel:
+    if: ${{ inputs.kernel_run_id == '' }}
     uses: ./.github/workflows/xnu.yml
 
   package:
     needs: kernel
+    if: ${{ always() && (needs.kernel.result == 'success' || (inputs.kernel_run_id != '' && needs.kernel.result == 'skipped')) }}
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
-      - name: Kernel from the xnu job
+      - name: Kernel from this run
+        if: ${{ inputs.kernel_run_id == '' }}
         uses: actions/download-artifact@v4
         with:
           name: xnu-kernel
           path: xnu/out
+
+      - name: Kernel from an earlier run
+        if: ${{ inputs.kernel_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.kernel_run_id }}
+          REPO: ${{ github.repository }}
+        run: gh run download "$RUN_ID" -R "$REPO" -n xnu-kernel -D xnu/out
 
       - name: Host tools
         run: |
@@ -61,7 +75,7 @@ jobs:
           fi
           lsmod | grep -E '^hfsplus' || { echo "hfsplus is not available" >&2; exit 1; }
           ls -l /dev/loop-control
-          xnu-out=$(ls -l xnu/out | head -20); echo "$xnu-out"
+          ls -l xnu/out
 
       - name: Build apfs-fuse
         run: |
