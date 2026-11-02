@@ -1,0 +1,214 @@
+# sunstone GPU recovery and fixed clocks (0125, 0130, 0131, 0133, 0134)
+
+2026-10-22. Validated on the phone: boot-47 (300 MHz), boot-49 (400 MHz) and boot-50
+(600 MHz) pass `sweetgpu --wedge --protect` with three attempt-0 recoveries, page flips on
+and a kernel-recorded `PASS` (canary 0xc0ffee45) on boot-49/50; full results table in
+[SUNSTONE.md](../SUNSTONE.md#gpu).
+Latest code: fork `834e51c`, matching XNU `2967215`.
+Initial implementation: `a86ccf0` in fork, matching XNU sources `cfbc46f`.
+Review fixes: `d594f7f` in fork, matching XNU sources `f8dc8b9` (0130):
+firmware FIFO takeover, feature negotiation, the recovery budget and zap retry.
+0131 (`7e9f53c` in fork, XNU `1888049`) restores the normal a6xx secure-mode
+restart; SCM stays a fallback only.
+Boot-48 (workspace `../../out/boot48-log31.txt`) records all six RPM ACKs, GX level `0xc0`,
+400 MHz RCG readback and a passing 2D selftest. All three deliberate failures
+recovered on attempt 0; GPU display copies continued (frame 1000 averaged 2682 us).
+Page flips were disabled by the init race below and all sweetgpu stdout was absent.
+The later boot-49/50 results resolve both gaps: flips stay on and kernel reports
+confirm the final canary and overall PASS at 400/600 MHz. Both use kernel CI
+39748355088, SHA-256 prefix `2aa6629f4cc98a94`; local logs are
+`../../out/boot49-log32.txt` and `../../out/boot50-log33.txt` (not committed).
+The default clock stays at the shim's 300 MHz. The current follow-ups are real
+clock measurement, long-run thermal behavior, DDR votes and GPU rendering
+([SUNSTONE.md](../SUNSTONE.md), TODO 6b/6c).
+
+## CP_PROTECT audit
+
+All 32 words in `SweetGPU.cpp` already match Linux's `a630_protect_regs`, including
+`0x09e70/0x0001`, `0x0ae50/0x032f`, `0x0be20/0x17df` and the final infinite span
+at `0x11c00`. The old handoff's “three ranges” TODO was stale. No range was changed.
+The host check can compare the complete table with a supplied Linux catalog;
+the device test `sweetgpu --protect` additionally attempts a hardware-protected
+`CP_REG_TO_MEM` read of `CP_RB_BASE` through an IB. That test must fail the
+submission and increment the successful recovery count. Boot-47 at 300 MHz has
+the full test stdout; boot-48 at 400 MHz records the protection fault and recovery
+but lacks the final user-space result. Boot-49/50 subsequently confirm the complete
+test with kernel-recorded PASS at 400/600 MHz.
+
+Reference: [Linux a6xx_catalog.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_catalog.c).
+
+## Recovery
+
+Previously a timeout detached CB0 to physical bypass while the old IB could still
+execute, then assigned the hardware RPTR to the software WPTR. That discarded no
+hardware state and could expose physical memory to the unfinished IB.
+
+The ring lock now covers display fence completion as well as client submission.
+On an incomplete client fence (even when RPTR reached WPTR), an SMMU fault, or a
+display fence timeout, recovery:
+
+1. Records the fault address/syndrome before reset can clear it.
+2. Halts SQE, requests the **a619_holi** GPR0 bus drain (`0x1e0`, ACK `0xf0`),
+   then halts GBIF client requests and AXI traffic with bounded waits.
+3. Asserts RBBM reset for at least 100 us. Only after a successful drain does it
+   detach the client and put CB0 in bypass.
+4. Restores the shim's immutable hardware setup, all 32 CP_PROTECT words, SQE
+   address, empty ring, `CP_ME_INIT` and the a619 2D context.
+5. Requires a new cache-flush fence before accepting another submission. If that
+   first restart fence fails, drains and resets again, then attempts one SCM
+   `BOOT_SET_REMOTE_STATE(ZAP_SHADER_RESUME=0, GPU_PAS=13)` and restarts once more.
+   **Attempt 0 always emits `CP_SET_SECURE_MODE 0` after `CP_ME_INIT`, with no SCM
+   call**, following Linux a6xx's reuse of an already-loaded zap shader. A normal
+   restart therefore works even if TZ does not support SCM zap resume. SCM is
+   only the attempt-1 fallback after a failed restart fence; its transport and
+   firmware result must both be zero before retrying the secure-mode packet.
+   Interrupted sessions preserve x6 and have a maximum of 32 SMC entries; no
+   firmware reload is attempted. The earlier 0130 assumption that every secure-mode
+   packet needed a successful SCM resume was incorrect for a6xx.
+
+The failed submission/frame still reports failure; a successful reset allows the
+next one to run. The framebuffer finishes a failed frame on the CPU and clears
+its sticky GPU-failed flag if recovery succeeded, so later frames can use GPU copies.
+A global streak counts workload failures requiring recovery; the **third consecutive
+failure** drains DMA and leaves reset asserted, then disables the GPU before another
+restart. A successful restart probe fence does **not** clear that streak. Only a
+completed client submission, completed display frame, or verified clock 2D selftest
+clears it. The counter spans both client and display paths under the ring lock.
+Thus a broken 2D path cannot incur a new timeout/reset on every later frame.
+Kernel fence sequence numbers keep increasing. If the bounded restart attempts fail,
+reset stays asserted and CPU presentation is the fallback. If the bus cannot drain,
+the attached VM, page tables, shadow IB and BO descriptors remain pinned until
+reboot. Each mapping takes its own `prepare()` reference, including wrapped task
+memory, so closing an IOSurface cannot unwire storage still owned by that DMA.
+
+The reset path does not collapse CX/GX or reset the whole GCC GPU block. References:
+[Linux a6xx_gpu.c](https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/msm/adreno/a6xx_gpu.c),
+local `../shim/gpu.c` (`hw_init`, `cp_start`, `blit2d_setup`). Boot-49/50 confirm
+attempt-0 recovery at 400/600 MHz without SCM resume. The optional SCM fallback has
+only simulated-hardware coverage.
+
+## Clocks above 300 MHz
+
+Boot argument: `sweetgpu_mhz=400` or `sweetgpu_mhz=600`; omission/300 keeps the
+shim clock. Other values are rejected. These are fixed GPLL0 divisions, not new
+GPU PLL settings or a DVFS/thermal governor.
+
+| MHz | GPLL0 / divider | RCG CFG | GX level | Stock OPP used as the voltage ceiling |
+| --- | --- | --- | --- | --- |
+| 300 | 600 / 2 | `0x503` | inherited | existing shim path |
+| 400 | 600 / 1.5 | `0x502` | `0xc0` | 490 MHz / `0xc0` |
+| 600 | 600 / 1 | `0x501` | `0x100` | 650 MHz / `0x100` |
+
+The live DT gives a **separate** GX rail: `pm6125_s8_level`, RPM `rwgx:0`,
+`vlvl`; topaz's `rwcx`-only recipe is not sufficient. MX (`rwmx:0`) and CX
+(`rwcx:0`) are voted to `0x100`, followed by GX to the table's level. Each resource
+gets `vlvl` then `swen=1`, active set only, with an exact matching RPM ACK required
+for every request before the RCG can change. Votes are retained for the boot,
+including after fallback; lowering them without aggregation could affect another
+subsystem. No sleep-state or DDR bandwidth votes were added.
+
+The transport uses RPM RAM `0x45f0000/0x7000`, validates both TOC FIFO ranges and
+indices, and rings **IPCC `0x208000`, client 0, signal 0** (not topaz's APCS).
+On the kernel's first takeover it resets only **TX head and RX tail**, as Linux
+`glink_rpm_probe` does; TX tail and RX head stay owned by the RPM. Nonzero firmware-era
+indices are accepted (invalid remote indices still fail). The same kernel owner
+cannot call init twice. VERSION accepts arbitrary feature bits, intersects them
+with the local feature mask of zero, and ACKs zero; a nonzero VERSION_ACK counter-offer
+resends VERSION with zero. Unsupported protocol versions, malformed/fragmented
+replies, stale/missing ACKs and error replies still fail. A rejected vote leaves the
+shim clock in place. Sources: [GLINK RPM probe](https://github.com/torvalds/linux/blob/master/drivers/rpmsg/qcom_glink_rpm.c)
+and [native VERSION negotiation](https://github.com/torvalds/linux/blob/master/drivers/rpmsg/qcom_glink_native.c).
+
+After RCG readback, a 16x4 pixel copy with distinct source values checks the 2D
+engine and cache flush at the selected rate. Failure attempts 300 MHz, CP recovery,
+and the same selftest. A failed RCG rollback disables GPU access without further
+GPU MMIO. `CORE_MHZ` reports the selected divider plus selftest result, not an
+independently measured clock frequency.
+
+Evidence: workspace `../../out/dt/sunstone-live.dts` (not committed: contains device
+identity), `../../research/linux-msm/gpucc-sm6375.c`,
+[Linux rpmpd.c](https://github.com/torvalds/linux/blob/master/drivers/pmdomain/qcom/rpmpd.c),
+[GLINK RPM transport](https://github.com/torvalds/linux/blob/master/drivers/rpmsg/qcom_glink_rpm.c),
+[RPM message format](https://github.com/torvalds/linux/blob/master/drivers/soc/qcom/smd-rpm.c),
+[TopazRpm reference](https://github.com/MakrSas/topaz-woa/blob/main/drivers/TopazRpm/driver.c).
+
+## Validation
+
+### Concurrent initialization (0133)
+
+SweetGPUDevice::start and framebuffer startup both call `sweet_gpu_ready()`.
+RPM negotiation made initialization long enough for framebuffer startup to read
+the temporary `gpu_state=-1` and permanently disable page flips. Boot-48 logs
+`page flips off` before even the first RPM vote. A separate lazily published
+IOLock now covers the whole initialization and cached-result lookup; concurrent
+callers wait for the owner to finish. This cannot use the ring lock because clock
+initialization takes that lock itself. Later runtime failures still return false.
+The host test pauses the owner during clock initialization, starts a framebuffer
+caller on a second thread and checks that both return success after release. It
+also checks that both observe a failed handoff, without retrying it.
+
+### Completion record (0134)
+
+The updated sweetgpu calls selector 8 `ReportTest [bo_handle, failures, flags]`
+before freeing its BO. Each client may report once. The kernel invalidates its
+CPU cache view, reads the actual word at BO offset `0x100`, and compares it with
+`0xc0ffee43` (base tests), `0xc0ffee44` (wedge), or `0xc0ffee45` (protect).
+PASS requires both zero reported user-test failures and a matching kernel-read
+canary. Flags bit 0 means wedge and bit 1 means protect. This is a diagnostic
+completion report, with the assertion count supplied by the test program.
+
+The single kernel summary starts `SWEET GPU: sweetgpu result PASS` or `FAIL`
+and includes flags, canary/expected values, MHz, reset count and report count.
+GetParam also retains the last report for the rest of the boot:
+
+| Param | Value |
+| --- | --- |
+| 8 | result: 0 no completed report, 1 PASS, 2 FAIL |
+| 9 | reported assertion failures |
+| 10 | kernel-read canary |
+| 11 | expected canary |
+| 12 | test flags |
+| 13 | completed report count |
+
+These parameters remain readable after GPU fallback and do not trigger GPU
+initialization. A missing completion report is unknown, never a PASS. The kernel
+and ios-tools must both include this update. The host tests execute the actual
+selector body, including malformed arguments/BOs, duplicate-report rejection,
+canary mismatch, all flag combinations and result retention with GPU disabled.
+
+`python3 tests/check-gpu.py` applies the GPU files from the complete patch series
+in a temporary directory and executes their actual C++ with IOKit/MMIO substitutes
+and UBSan. Tests cover handoff initialization and its concurrency race, completion
+reporting, recovery order, stalled/faulted IBs,
+next-submission success, failed bus drain/restart, pinned BO lifetime, the
+three-failure cutoff and real-work reset of that budget, normal secure-mode
+restart with SCM unsupported, fallback-only zap resume and bounded interrupted sessions, 400/600 MHz with firmware-era FIFO indices and
+nonzero feature offers, AP/RPM index ownership, counter-offer negotiation,
+malformed/stale/error/missing ACKs, FIFO wrap and 2D fallback. `--source-root ../work/xnu` also requires byte-identical patched sources;
+`--catalog ../research/linux-msm/a6xx_catalog.c` compares all 32 protection words.
+`--clang PATH --resource-dir PATH` adds a Mach-O compile with declaration stubs.
+
+Local results: all host checks passed. Additionally, the latest changed `SweetGPU.cpp`
+and `SweetGPUDevice.cpp` compiled to arm64 Mach-O objects using the **real XNU headers and generated
+build files** from successful CI **39733814183**, buildtree artifact **12405779477**,
+and that run's compile flags (Ubuntu clang 17, xnu-cc.py compatibility definitions).
+This is a translation-unit check, not a complete kernel link or device test.
+
+The iOS `sweetgpu` tool now prints parameters 6 (`CORE_MHZ`) and 7 (`RESETS`),
+returns nonzero on failed assertions, and verifies a fresh successful submission
+after **each** deliberately faulted/wedged/protected IB. These real canaries reset
+the recovery budget between independent tests; three deliberate failures in a row
+would now correctly disable the GPU. Opt-in `--wedge` submits an impossible `CP_WAIT_REG_MEM` on a
+mapped BO; `--protect` exercises the protection fault described above.
+
+For future kernel regressions, run `sweetgpu --wedge --protect` at 300/400/600 MHz
+with matching ios-tools. Require page flips enabled and increasing flip counts,
+six RPM ACKs for 400/600, RCG/selftest success, all three recoveries and kernel
+`sweetgpu result PASS` with flags 3 and canary `0xc0ffee45`. Retained params must
+show result 1 and at least one report even if stdout is lost. Record the kernel
+commit, CI run, boot image/hash and device log for each run.
+
+Remaining hardware work: measure the actual clock and rails, check sustained
+600 MHz temperature beyond the battery gauge, and assess DDR bandwidth voting
+before changing the default. CoreAnimation still renders on the CPU; GPU rendering
+is a separate open item.
