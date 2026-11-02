@@ -92,7 +92,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ipsw.zip
-          key: ipsw-${{ inputs.ipsw_url }}
+          # A literal key: the URL contains commas, which a cache key rejects.
+          # Bump this string whenever ipsw_url points at another build.
+          key: ipsw-16.7.16-20H392-d22ap
 
       - name: Download IPSW
         if: steps.ipsw.outputs.cache-hit != 'true'
