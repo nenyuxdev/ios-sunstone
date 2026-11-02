@@ -70,8 +70,9 @@ jobs:
           # blacktop ipsw: `img4 im4p extract` turns the DeviceTree IM4P into the
           # .adt that tools/mkadt.py reads.
           url=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest \
-                | jq -r '.assets[] | select(.name | test("linux_amd64\\.tar\\.gz$")) | .browser_download_url' \
+                | jq -r '.assets[] | select(.name | test("^ipsw_.*linux_x86_64\\.tar\\.gz$")) | .browser_download_url' \
                 | head -1)
+          [ -n "$url" ] || { echo "no ipsw release asset for linux_x86_64" >&2; exit 1; }
           echo "ipsw download: $url"
           curl -fsSL "$url" | sudo tar xz -C /usr/local/bin ipsw
           ipsw version
