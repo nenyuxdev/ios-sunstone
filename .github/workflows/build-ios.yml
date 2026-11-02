@@ -80,7 +80,8 @@ jobs:
       - name: Build apfs-fuse
         run: |
           set -x
-          git clone --depth 1 https://github.com/sgan81/apfs-fuse.git
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/sgan81/apfs-fuse.git
           cmake -S apfs-fuse -B apfs-fuse/build -DCMAKE_BUILD_TYPE=Release
           cmake --build apfs-fuse/build -j"$(nproc)"
           sudo cmake --install apfs-fuse/build
