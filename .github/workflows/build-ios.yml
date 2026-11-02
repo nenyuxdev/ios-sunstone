@@ -38,7 +38,7 @@ jobs:
   package:
     needs: kernel
     if: ${{ always() && (needs.kernel.result == 'success' || (inputs.kernel_run_id != '' && needs.kernel.result == 'skipped')) }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +66,7 @@ jobs:
             build-essential cmake pkg-config libfuse3-dev libbz2-dev zlib1g-dev libssl-dev \
             hfsprogs rsync cpio curl unzip jq \
             gcc-aarch64-linux-gnu android-sdk-libsparse-utils python3-pip
-          python3 -m pip install --quiet pyimg4
+          python3 -m pip install --quiet --break-system-packages pyimg4 || true
           # blacktop ipsw: `img4 im4p extract` turns the DeviceTree IM4P into the
           # .adt that tools/mkadt.py reads.
           url=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest \
