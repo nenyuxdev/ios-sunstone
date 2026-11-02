@@ -165,7 +165,8 @@ jobs:
             GPUFW="$PWD/out/gpu-fw.blob"
             CMDLINE="${CMDLINE/sweetgpu=0 sweetfb_flip=0/}"
           fi
-          CMDLINE="$CMDLINE" GPUFW="$GPUFW" tools/mkboot.sh xnu/out/kernel.development.sweet out/boot.img
+          chmod +x tools/*.sh shim/*.sh
+          CMDLINE="$CMDLINE" GPUFW="$GPUFW" bash tools/mkboot.sh xnu/out/kernel.development.sweet out/boot.img
 
       - name: Record outputs
         run: |
