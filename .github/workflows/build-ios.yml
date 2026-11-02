@@ -162,3 +162,4 @@ jobs:
             work/**/*.log
             out/*.txt
           if-no-files-found: ignore
+# reindex marker: forces GitHub to re-register this workflow
