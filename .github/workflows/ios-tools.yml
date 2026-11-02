@@ -33,3 +33,4 @@ jobs:
         with:
           name: ios-tools
           path: out/
+# reindex marker: forces GitHub to re-register this workflow
