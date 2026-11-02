@@ -87,12 +87,26 @@ jobs:
           sudo cmake --install apfs-fuse/build
           command -v apfs-fuse
 
+      - name: Cache the IPSW
+        id: ipsw
+        uses: actions/cache@v4
+        with:
+          path: ipsw.zip
+          key: ipsw-${{ inputs.ipsw_url }}
+
       - name: Download IPSW
+        if: steps.ipsw.outputs.cache-hit != 'true'
         run: |
           set -x
           curl -L --retry 3 --retry-delay 5 -o ipsw.zip "${{ inputs.ipsw_url }}"
           ls -l ipsw.zip
           sha256sum ipsw.zip | tee ipsw.sha256
+
+      - name: Check the IPSW
+        run: |
+          set -x
+          [ -f ipsw.sha256 ] || sha256sum ipsw.zip | tee ipsw.sha256
+          ls -l ipsw.zip
 
       - name: Extract the four inputs
         run: |
