@@ -4,13 +4,16 @@
   ipsw-extract.py IPSW OUTDIR [--device d22ap] [--list]
 
 Writes OUTDIR/paths.env with OS=, SYSOS=, APPOS=, ADT= so a shell can source it.
-The three DMGs are read-only APFS images inside the zip; the DeviceTree is an
-IM4P that is decompressed to the .adt that tools/mkadt.py reads for the product
-properties (chip id, board id, model).
+The DMGs are APFS images inside the zip; the DeviceTree is an IM4P that is
+decompressed to the .adt that tools/mkadt.py reads for the product properties
+(chip id, board id, model).
 
-An IPSW carries several BuildIdentities (upgrade, erase, ...). The right one is
-the identity whose DeviceTree names this board and whose manifest has all four
-entries; --list prints every identity so a mismatch is obvious.
+An IPSW carries several BuildIdentities (one per board and restore variant), and
+on iOS 16 the cryptexes are not always listed per identity: the 20H392 iPhone X
+manifest exposes OS and DeviceTree only, while the SystemOS and AppOS DMGs sit in
+the archive as separate members (Cryptex1,SystemOS / Cryptex1,AppOS). The lookup
+therefore tries the manifest key, its Cryptex1 alias, and finally identifies the
+remaining DMGs by size (AppOS is the small one, SystemOS the middle one).
 
 pyimg4 is used when importable, otherwise the blacktop `ipsw` CLI:
     pip install pyimg4        # or: ipsw img4 im4p extract ...
@@ -23,7 +26,27 @@ import sys
 import zipfile
 from pathlib import Path
 
-ROLES = {"OS": "OS", "SystemOS": "SYSOS", "AppOS": "APPOS", "DeviceTree": "ADT"}
+ROLES = ("OS", "SystemOS", "AppOS", "DeviceTree")
+ALIASES = {
+    "OS": ("os",),
+    "SystemOS": ("systemos", "cryptex1systemos", "cryptex1,systemos"),
+    "AppOS": ("appos", "cryptex1appos", "cryptex1,appos"),
+    "DeviceTree": ("devicetree",),
+}
+
+
+def normalise(key):
+    return key.replace(" ", "").lower()
+
+
+def entry_path(entries, role):
+    for key, value in entries.items():
+        name = normalise(key)
+        if any(name == alias for alias in ALIASES[role]):
+            path = ((value or {}).get("Info") or {}).get("Path")
+            if path:
+                return path
+    return None
 
 
 def describe(manifest, device):
@@ -31,8 +54,8 @@ def describe(manifest, device):
     for index, ident in enumerate(manifest.get("BuildIdentities") or []):
         entries = ident.get("Manifest", {})
         info = ident.get("Info", {})
-        present = [role for role in ROLES if ((entries.get(role) or {}).get("Info") or {}).get("Path")]
-        tree = ((entries.get("DeviceTree") or {}).get("Info") or {}).get("Path", "")
+        present = [role for role in ROLES if entry_path(entries, role)]
+        tree = entry_path(entries, "DeviceTree") or ""
         rows.append(
             {
                 "index": index,
@@ -47,7 +70,7 @@ def describe(manifest, device):
     return rows
 
 
-def report(rows):
+def report(rows, manifest):
     print("identities:", file=sys.stderr)
     for row in rows:
         print(
@@ -55,18 +78,36 @@ def report(rows):
             f"match={row['match']} roles={','.join(row['roles']) or '-'} tree={row['tree']}",
             file=sys.stderr,
         )
+    if rows:
+        keys = sorted(manifest["BuildIdentities"][rows[0]["index"]].get("Manifest", {}))
+        print("manifest keys of identity 0: " + ", ".join(keys), file=sys.stderr)
 
 
 def pick(rows):
-    complete = [r for r in rows if set(ROLES) <= set(r["roles"])]
-    for pool in ([r for r in complete if r["match"]], complete):
-        if pool:
-            return pool[0]
-    best = max(rows, key=lambda r: (len(r["roles"]), r["match"]), default=None)
-    if best is None:
+    scored = [r for r in rows if "OS" in r["roles"] and r["match"]]
+    scored.sort(key=lambda r: len(r["roles"]), reverse=True)
+    if scored:
+        return scored[0]
+    fallback = sorted(rows, key=lambda r: len(r["roles"]), reverse=True)
+    if not fallback:
         sys.exit("BuildManifest.plist has no BuildIdentities")
-    missing = sorted(set(ROLES) - set(best["roles"]))
-    sys.exit(f"no identity has all of {sorted(ROLES)}; closest is [{best['index']}] missing {missing}")
+    print("no identity names this board in its DeviceTree; using the most complete one", file=sys.stderr)
+    return fallback[0]
+
+
+def dmg_by_size(zf, exclude):
+    """Identify the cryptex DMGs by size when the manifest does not list them.
+
+    iPhone X 20H392: OS 4.7 GB, SystemOS 2.7 GB, AppOS 10 MB. Ranking the
+    remaining members by size gives the two cryptexes.
+    """
+    members = [
+        info
+        for info in zf.infolist()
+        if info.filename.endswith(".dmg") and info.filename not in exclude
+    ]
+    members.sort(key=lambda info: info.file_size, reverse=True)
+    return members
 
 
 def member(zf, path):
@@ -110,19 +151,38 @@ def main():
     with zipfile.ZipFile(args.ipsw) as zf:
         manifest = plistlib.loads(zf.read("BuildManifest.plist"))
         rows = describe(manifest, args.device)
-        report(rows)
+        report(rows, manifest)
         if args.list:
             return
         chosen = pick(rows)
-        ident = manifest["BuildIdentities"][chosen["index"]]
-        entries = ident.get("Manifest", {})
+        entries = manifest["BuildIdentities"][chosen["index"]].get("Manifest", {})
         print(f"using identity [{chosen['index']}] {chosen['product']} {chosen['build']}", file=sys.stderr)
+
+        paths = {role: entry_path(entries, role) for role in ROLES}
+        missing = [role for role in ("SystemOS", "AppOS") if not paths[role]]
+        if missing:
+            used = {p for p in paths.values() if p}
+            spare = dmg_by_size(zf, used)
+            print(
+                "manifest does not name "
+                + ", ".join(missing)
+                + "; candidates by size: "
+                + ", ".join(f"{i.filename} ({i.file_size})" for i in spare),
+                file=sys.stderr,
+            )
+            if len(spare) >= 2:
+                # largest spare is SystemOS, the smallest is AppOS
+                if not paths["SystemOS"]:
+                    paths["SystemOS"] = spare[0].filename
+                if not paths["AppOS"]:
+                    paths["AppOS"] = spare[-1].filename
+        for role in ROLES:
+            if not paths[role]:
+                sys.exit(f"could not locate the {role} input in this IPSW")
+
         values = {}
-        for role, key in ROLES.items():
-            info = (entries.get(role) or {}).get("Info") or {}
-            path = info.get("Path")
-            if not path:
-                sys.exit(f"identity [{chosen['index']}] has no {role} entry")
+        for role in ROLES:
+            path = paths[role]
             data = zf.read(member(zf, path))
             if role == "DeviceTree":
                 target = args.outdir / f"{args.device}.adt"
@@ -130,7 +190,7 @@ def main():
             else:
                 target = args.outdir / Path(path).name
                 target.write_bytes(data)
-            values[key] = target.resolve()
+            values[{"OS": "OS", "SystemOS": "SYSOS", "AppOS": "APPOS", "DeviceTree": "ADT"}[role]] = target.resolve()
             print(f"{role:11} {path} -> {target.name} ({target.stat().st_size} bytes)", file=sys.stderr)
 
     env = args.outdir / "paths.env"
