@@ -64,9 +64,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config libfuse3-dev libbz2-dev zlib1g-dev libssl-dev \
-            hfsprogs rsync cpio curl unzip \
+            hfsprogs rsync cpio curl unzip jq \
             gcc-aarch64-linux-gnu android-sdk-libsparse-utils python3-pip
           python3 -m pip install --quiet pyimg4
+          # blacktop ipsw: `img4 im4p extract` turns the DeviceTree IM4P into the
+          # .adt that tools/mkadt.py reads.
+          url=$(curl -fsSL https://api.github.com/repos/blacktop/ipsw/releases/latest \
+                | jq -r '.assets[] | select(.name | test("linux_amd64\\.tar\\.gz$")) | .browser_download_url' \
+                | head -1)
+          echo "ipsw download: $url"
+          curl -fsSL "$url" | sudo tar xz -C /usr/local/bin ipsw
+          ipsw version
           # The HFS+ loop mount needs the module; the runner kernel may ship it
           # in linux-modules-extra instead of the base package.
           if ! sudo modprobe hfsplus; then
