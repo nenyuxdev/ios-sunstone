@@ -1,6 +1,7 @@
 name: xnu
 
 on:
+  workflow_call:
   workflow_dispatch:
     inputs:
       macos_version:

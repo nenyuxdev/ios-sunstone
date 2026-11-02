@@ -1,0 +1,164 @@
+name: build-ios
+
+# One run produces the two artifacts a flash needs: the shim boot image and the
+# iOS root image. The kernel comes from xnu.yml (macOS runner, about 6 minutes);
+# everything else is built on Ubuntu, where the HFS+ image can be created with
+# loop mounts and apfs-fuse.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: iPhone X (iPhone10,3) iOS 16.7.16 restore image
+        default: "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+      root_size:
+        description: size of the HFS+ root image
+        default: "16G"
+      gpu_blob_b64:
+        description: "optional base64 of out/gpu-fw.blob from tools/gpu-build.sh; empty builds a software-rendering image"
+        default: ""
+  push:
+    branches: [sunstone]
+    paths:
+      - ".github/workflows/build-ios.yml"
+      - "tools/ipsw-extract.py"
+
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kernel:
+    uses: ./.github/workflows/xnu.yml
+
+  package:
+    needs: kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kernel from the xnu job
+        uses: actions/download-artifact@v4
+        with:
+          name: xnu-kernel
+          path: xnu/out
+
+      - name: Host tools
+        run: |
+          set -x
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libfuse3-dev libbz2-dev zlib1g-dev libssl-dev \
+            hfsprogs rsync cpio curl unzip \
+            gcc-aarch64-linux-gnu android-sdk-libsparse-utils python3-pip
+          python3 -m pip install --quiet pyimg4
+          # The HFS+ loop mount needs the module; the runner kernel may ship it
+          # in linux-modules-extra instead of the base package.
+          if ! sudo modprobe hfsplus; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe hfsplus
+          fi
+          lsmod | grep -E '^hfsplus' || { echo "hfsplus is not available" >&2; exit 1; }
+          ls -l /dev/loop-control
+          xnu-out=$(ls -l xnu/out | head -20); echo "$xnu-out"
+
+      - name: Build apfs-fuse
+        run: |
+          set -x
+          git clone --depth 1 https://github.com/sgan81/apfs-fuse.git
+          cmake -S apfs-fuse -B apfs-fuse/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build apfs-fuse/build -j"$(nproc)"
+          sudo cmake --install apfs-fuse/build
+          command -v apfs-fuse
+
+      - name: Download IPSW
+        run: |
+          set -x
+          curl -L --retry 3 --retry-delay 5 -o ipsw.zip "${{ inputs.ipsw_url }}"
+          ls -l ipsw.zip
+          sha256sum ipsw.zip | tee ipsw.sha256
+
+      - name: Extract the four inputs
+        run: |
+          set -x
+          python3 tools/ipsw-extract.py ipsw.zip work/ipsw --device d22ap
+          cat work/ipsw/paths.env
+
+      - name: Build the HFS+ root image
+        run: |
+          set -x
+          set -a; . work/ipsw/paths.env; set +a
+          mkdir -p out
+          sudo -E bash tools/mkiosroot.sh "$OS" "$SYSOS" "$APPOS" out/ios16-root.img "${{ inputs.root_size }}"
+          df -h .
+
+      - name: Apply the SWEET root tweaks
+        run: |
+          set -x
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force out/ios16-root.img /mnt/iosroot
+          sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+          sudo umount /mnt/iosroot
+
+      - name: Free disk space
+        run: |
+          set -x
+          rm -rf work/ipsw ipsw.zip apfs-fuse
+          df -h .
+
+      - name: Sparse and split the root image
+        run: |
+          set -x
+          img2simg out/ios16-root.img out/ios16-root.simg
+          rm -f out/ios16-root.img
+          split -b 1800M -d -a 2 out/ios16-root.simg out/ios16-root.simg.part
+          ls -l out
+
+      - name: Build the boot image
+        run: |
+          set -x
+          CMDLINE="debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetfb_hz=60 sweetfb_noconsole=1 sweetgpu=0 sweetfb_flip=0"
+          GPUFW=""
+          if [ -n "${{ inputs.gpu_blob_b64 }}" ]; then
+            printf '%s' "${{ inputs.gpu_blob_b64 }}" | base64 -d > out/gpu-fw.blob
+            GPUFW="$PWD/out/gpu-fw.blob"
+            CMDLINE="${CMDLINE/sweetgpu=0 sweetfb_flip=0/}"
+          fi
+          CMDLINE="$CMDLINE" GPUFW="$GPUFW" tools/mkboot.sh xnu/out/kernel.development.sweet out/boot.img
+
+      - name: Record outputs
+        run: |
+          {
+            echo "run: $GITHUB_RUN_ID"
+            echo "commit: $GITHUB_SHA"
+            echo "ipsw: $(cat ipsw.sha256)"
+            sha256sum out/boot.img out/ios16-root.simg.part* || true
+          } | tee out/SHA256SUMS.txt
+
+      - name: Upload boot image
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunstone-boot
+          path: |
+            out/boot.img
+            out/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Upload root image
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunstone-root
+          path: out/ios16-root.simg.part*
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            work/**/*.log
+            out/*.txt
+          if-no-files-found: ignore
