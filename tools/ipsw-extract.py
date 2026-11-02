@@ -117,16 +117,28 @@ def member(zf, path):
         sys.exit(f"IPSW does not contain {path}")
 
 
+def _as_bytes(value, depth=0):
+    """Pull bytes out of whatever a library hands back (bytes, memoryview, wrapper)."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if value is None or depth > 3:
+        return None
+    for attr in ("output", "data", "payload", "value", "_data"):
+        item = getattr(value, attr, None)
+        if callable(item):
+            try:
+                item = item()
+            except TypeError:
+                continue
+        found = _as_bytes(item, depth + 1)
+        if found:
+            return found
+    return None
+
+
 def decompress_im4p(data):
-    try:
-        from pyimg4 import IM4P  # type: ignore
-    except ImportError:
-        IM4P = None
-    if IM4P is not None:
-        try:
-            return IM4P(data).payload.output()
-        except Exception as exc:  # noqa: BLE001 - fall through to the CLI
-            print(f"pyimg4 failed ({exc}); trying the ipsw CLI", file=sys.stderr)
+    # The blacktop CLI is what the port's own notes use; it always returns the
+    # decompressed payload, so prefer it and keep pyimg4 as the fallback.
     if shutil.which("ipsw"):
         tmp = Path(".im4p.tmp")
         tmp.write_bytes(data)
@@ -136,6 +148,18 @@ def decompress_im4p(data):
         tmp.unlink(missing_ok=True)
         out.unlink(missing_ok=True)
         return result
+    try:
+        from pyimg4 import IM4P  # type: ignore
+    except ImportError:
+        IM4P = None
+    if IM4P is not None:
+        try:
+            result = _as_bytes(IM4P(data).payload)
+        except Exception as exc:  # noqa: BLE001
+            sys.exit(f"pyimg4 could not read the DeviceTree payload: {exc}")
+        if result:
+            return result
+        sys.exit("pyimg4 returned no payload bytes: install the ipsw CLI instead")
     sys.exit("no IM4P decompressor: pip install pyimg4 (or install the ipsw CLI)")
 
 
