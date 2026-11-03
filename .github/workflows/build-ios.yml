@@ -135,33 +135,6 @@ jobs:
           python3 tools/ipsw-extract.py ipsw.zip work/ipsw --device d22ap
           cat work/ipsw/paths.env
 
-      - name: Read launchd.plist out of the root image
-        if: ${{ inputs.crashlog_drop == '1' }}
-        run: |
-          set -x
-          set -a; . work/ipsw/paths.env; set +a
-          mkdir -p out mnt-os
-          mnt=$PWD/mnt-os
-          sudo "$(command -v apfs-fuse)" "$(realpath "$OS")" "$mnt"
-          for i in $(seq 1 60); do
-            [ -e "$mnt/System/Library/xpc/launchd.plist" ] && break
-            sleep 1
-          done
-          sudo cp "$mnt/System/Library/xpc/launchd.plist" out/launchd.plist
-          sudo umount "$mnt" || true
-          ls -l out/launchd.plist
-
-      - name: Build the crash-log drop
-        if: ${{ inputs.crashlog_drop == '1' }}
-        run: |
-          set -x
-          mkdir -p out
-          chmod +x drop/crashlog.sh
-          python3 tools/mkdrop.py out/drop.bin \
-            --launchd out/launchd.plist drop/crashlog-job.plist \
-            drop/crashlog.sh:/usr/local/sweet-crashlog.sh:0755
-          ls -l out/drop.bin
-
       - name: Build the HFS+ root image
         if: ${{ inputs.skip_root != '1' }}
         run: |
@@ -178,7 +151,23 @@ jobs:
           sudo mkdir -p /mnt/iosroot
           sudo mount -t hfsplus -o loop,force out/ios16-root.img /mnt/iosroot
           sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+          # Keep launchd.plist for the crash-log drop (mkdrop --launchd merges into it).
+          if [ "${{ inputs.crashlog_drop }}" = "1" ]; then
+            sudo cp /mnt/iosroot/System/Library/xpc/launchd.plist out/launchd.plist
+            sudo chown "$(id -u):$(id -g)" out/launchd.plist
+          fi
           sudo umount /mnt/iosroot
+
+      - name: Build the crash-log drop
+        if: ${{ inputs.crashlog_drop == '1' }}
+        run: |
+          set -x
+          mkdir -p out
+          chmod +x drop/crashlog.sh
+          python3 tools/mkdrop.py out/drop.bin \
+            --launchd out/launchd.plist drop/crashlog-job.plist \
+            drop/crashlog.sh:/usr/local/sweet-crashlog.sh:0755
+          ls -l out/drop.bin
 
       - name: Free disk space
         run: |
@@ -238,7 +227,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload root image
-        if: ${{ inputs.skip_root != '1' }}
+        if: ${{ inputs.skip_root != '1' && inputs.crashlog_drop != '1' }}
         uses: actions/upload-artifact@v4
         with:
           name: sunstone-root
