@@ -17,6 +17,9 @@ on:
       gpu_blob_b64:
         description: "optional base64 of out/gpu-fw.blob from tools/gpu-build.sh; empty builds a software-rendering image"
         default: ""
+      crashlog_drop:
+        description: "1 = add a launchd job that prints crash reports to the console"
+        default: "0"
       skip_root:
         description: "1 = build only the boot image (root image already flashed)"
         default: "0"
@@ -90,7 +93,7 @@ jobs:
           ls -l xnu/out
 
       - name: Build apfs-fuse
-        if: ${{ inputs.skip_root != '1' }}
+        if: ${{ inputs.skip_root != '1' || inputs.crashlog_drop == '1' }}
         run: |
           set -x
           git clone --depth 1 --recurse-submodules --shallow-submodules \
@@ -101,7 +104,7 @@ jobs:
           command -v apfs-fuse
 
       - name: Cache the IPSW
-        if: ${{ inputs.skip_root != '1' }}
+        if: ${{ inputs.skip_root != '1' || inputs.crashlog_drop == '1' }}
         id: ipsw
         uses: actions/cache@v4
         with:
@@ -111,7 +114,7 @@ jobs:
           key: ipsw-16.7.16-20H392-d22ap
 
       - name: Download IPSW
-        if: ${{ inputs.skip_root != '1' && steps.ipsw.outputs.cache-hit != 'true' }}
+        if: ${{ (inputs.skip_root != '1' || inputs.crashlog_drop == '1') && steps.ipsw.outputs.cache-hit != 'true' }}
         run: |
           set -x
           curl -L --retry 3 --retry-delay 5 -o ipsw.zip "${{ inputs.ipsw_url }}"
@@ -119,18 +122,40 @@ jobs:
           sha256sum ipsw.zip | tee ipsw.sha256
 
       - name: Check the IPSW
-        if: ${{ inputs.skip_root != '1' }}
+        if: ${{ inputs.skip_root != '1' || inputs.crashlog_drop == '1' }}
         run: |
           set -x
           [ -f ipsw.sha256 ] || sha256sum ipsw.zip | tee ipsw.sha256
           ls -l ipsw.zip
 
       - name: Extract the four inputs
-        if: ${{ inputs.skip_root != '1' }}
+        if: ${{ inputs.skip_root != '1' || inputs.crashlog_drop == '1' }}
         run: |
           set -x
           python3 tools/ipsw-extract.py ipsw.zip work/ipsw --device d22ap
           cat work/ipsw/paths.env
+
+      - name: Read launchd.plist out of the root image
+        if: ${{ inputs.crashlog_drop == '1' }}
+        run: |
+          set -x
+          set -a; . work/ipsw/paths.env; set +a
+          mkdir -p out mnt-os
+          sudo "$(command -v apfs-fuse)" "$OS" mnt-os
+          sudo cp mnt-os/System/Library/xpc/launchd.plist out/launchd.plist
+          sudo umount mnt-os
+          ls -l out/launchd.plist
+
+      - name: Build the crash-log drop
+        if: ${{ inputs.crashlog_drop == '1' }}
+        run: |
+          set -x
+          mkdir -p out
+          chmod +x drop/crashlog.sh
+          python3 tools/mkdrop.py out/drop.bin \
+            --launchd out/launchd.plist drop/crashlog-job.plist \
+            drop/crashlog.sh:/usr/local/sweet-crashlog.sh:0755
+          ls -l out/drop.bin
 
       - name: Build the HFS+ root image
         if: ${{ inputs.skip_root != '1' }}
@@ -184,8 +209,10 @@ jobs:
             GPUFW="$PWD/out/gpu-fw.blob"
             CMDLINE="${CMDLINE/sweetgpu=0 sweetfb_flip=0/}"
           fi
+          DROP=""
+          if [ "${{ inputs.crashlog_drop }}" = "1" ]; then DROP="$PWD/out/drop.bin"; fi
           chmod +x tools/*.sh shim/*.sh
-          CMDLINE="$CMDLINE" GPUFW="$GPUFW" bash tools/mkboot.sh xnu/out/kernel.development.sweet out/boot.img
+          DROP="$DROP" CMDLINE="$CMDLINE" GPUFW="$GPUFW" bash tools/mkboot.sh xnu/out/kernel.development.sweet out/boot.img
 
       - name: Record outputs
         run: |
