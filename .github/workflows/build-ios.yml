@@ -141,9 +141,14 @@ jobs:
           set -x
           set -a; . work/ipsw/paths.env; set +a
           mkdir -p out mnt-os
-          sudo "$(command -v apfs-fuse)" "$OS" mnt-os
-          sudo cp mnt-os/System/Library/xpc/launchd.plist out/launchd.plist
-          sudo umount mnt-os
+          mnt=$PWD/mnt-os
+          sudo "$(command -v apfs-fuse)" "$(realpath "$OS")" "$mnt"
+          for i in $(seq 1 60); do
+            [ -e "$mnt/System/Library/xpc/launchd.plist" ] && break
+            sleep 1
+          done
+          sudo cp "$mnt/System/Library/xpc/launchd.plist" out/launchd.plist
+          sudo umount "$mnt" || true
           ls -l out/launchd.plist
 
       - name: Build the crash-log drop
