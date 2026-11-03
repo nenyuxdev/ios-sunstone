@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 name=${1:?usage: kbuild.sh NAME [LABEL="boot-args"]...}; shift
 repo=$(git remote get-url origin | sed -E 's#^(git@github.com:|https://github.com/)##; s#\.git$##')
 branch=$(git rev-parse --abbrev-ref HEAD)
-base="debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetfb_hz=60 sweetfb_noconsole=1"
+base="debug=0xc serial=3 cpus=6 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetfb_hz=30 sweetfb_noconsole=1"
 head=$(git rev-parse HEAD)
 [ "$(git rev-parse "origin/$branch")" = "$head" ] || { echo "push $branch first" >&2; exit 1; }
 

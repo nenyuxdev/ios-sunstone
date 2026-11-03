@@ -11,7 +11,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KERNEL=$(realpath "$1")
 OUT=${2:-$ROOT/out/sunstone-xnu-boot.img}
 mkdir -p "$ROOT/out"
-CMDLINE=${CMDLINE:-'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetfb_hz=60 sweetfb_noconsole=1'}
+CMDLINE=${CMDLINE:-'debug=0xc serial=3 cpus=6 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetfb_hz=30 sweetfb_noconsole=1'}
 
 if [ "${3:-}" = --qemu ]; then
 	python3 "$ROOT/tools/mkadt.py" "$ROOT/out/qemu.adt" --qemu
