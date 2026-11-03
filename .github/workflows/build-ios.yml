@@ -17,6 +17,9 @@ on:
       gpu_blob_b64:
         description: "optional base64 of out/gpu-fw.blob from tools/gpu-build.sh; empty builds a software-rendering image"
         default: ""
+      skip_root:
+        description: "1 = build only the boot image (root image already flashed)"
+        default: "0"
       kernel_run_id:
         description: "reuse the xnu-kernel artifact of an earlier run instead of rebuilding the kernel"
         default: ""
@@ -87,6 +90,7 @@ jobs:
           ls -l xnu/out
 
       - name: Build apfs-fuse
+        if: ${{ inputs.skip_root != '1' }}
         run: |
           set -x
           git clone --depth 1 --recurse-submodules --shallow-submodules \
@@ -97,6 +101,7 @@ jobs:
           command -v apfs-fuse
 
       - name: Cache the IPSW
+        if: ${{ inputs.skip_root != '1' }}
         id: ipsw
         uses: actions/cache@v4
         with:
@@ -106,7 +111,7 @@ jobs:
           key: ipsw-16.7.16-20H392-d22ap
 
       - name: Download IPSW
-        if: steps.ipsw.outputs.cache-hit != 'true'
+        if: ${{ inputs.skip_root != '1' && steps.ipsw.outputs.cache-hit != 'true' }}
         run: |
           set -x
           curl -L --retry 3 --retry-delay 5 -o ipsw.zip "${{ inputs.ipsw_url }}"
@@ -114,18 +119,21 @@ jobs:
           sha256sum ipsw.zip | tee ipsw.sha256
 
       - name: Check the IPSW
+        if: ${{ inputs.skip_root != '1' }}
         run: |
           set -x
           [ -f ipsw.sha256 ] || sha256sum ipsw.zip | tee ipsw.sha256
           ls -l ipsw.zip
 
       - name: Extract the four inputs
+        if: ${{ inputs.skip_root != '1' }}
         run: |
           set -x
           python3 tools/ipsw-extract.py ipsw.zip work/ipsw --device d22ap
           cat work/ipsw/paths.env
 
       - name: Build the HFS+ root image
+        if: ${{ inputs.skip_root != '1' }}
         run: |
           set -x
           set -a; . work/ipsw/paths.env; set +a
@@ -134,6 +142,7 @@ jobs:
           df -h .
 
       - name: Apply the SWEET root tweaks
+        if: ${{ inputs.skip_root != '1' }}
         run: |
           set -x
           sudo mkdir -p /mnt/iosroot
@@ -148,6 +157,7 @@ jobs:
           df -h .
 
       - name: Sparse and split the root image
+        if: ${{ inputs.skip_root != '1' }}
         run: |
           set -x
           img2simg out/ios16-root.img out/ios16-root.simg
@@ -156,10 +166,18 @@ jobs:
           ls -l out
 
       - name: Build the boot image
+        env:
+          GPU_BLOB_GZ: ${{ secrets.GPU_BLOB_GZ }}
         run: |
           set -x
           CMDLINE="debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetcpufreq=0 sweetfb_hz=60 sweetfb_noconsole=1 sweetgpu=0 sweetfb_flip=0"
           GPUFW=""
+          if [ -n "${GPU_BLOB_GZ:-}" ]; then
+            printf '%s' "$GPU_BLOB_GZ" | base64 -d | gunzip > out/gpu-fw.blob
+            GPUFW="$PWD/out/gpu-fw.blob"
+            CMDLINE="${CMDLINE/sweetgpu=0 sweetfb_flip=0/}"
+            echo "GPU firmware: $(stat -c%s out/gpu-fw.blob) bytes"
+          fi
           if [ -n "${{ inputs.gpu_blob_b64 }}" ]; then
             printf '%s' "${{ inputs.gpu_blob_b64 }}" | base64 -d > out/gpu-fw.blob
             GPUFW="$PWD/out/gpu-fw.blob"
@@ -187,6 +205,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload root image
+        if: ${{ inputs.skip_root != '1' }}
         uses: actions/upload-artifact@v4
         with:
           name: sunstone-root
