@@ -1,0 +1,178 @@
+name: Build iOS rootfs (userdata)
+
+on:
+  workflow_dispatch:
+    inputs:
+      root_size:
+        description: "Logical HFS+ userdata image size"
+        required: true
+        default: "16G"
+
+permissions:
+  contents: read
+
+jobs:
+  build-rootfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    env:
+      IPSW_URL: "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+      IPSW_SHA256: "ece1194f7e233e9109c5790a8d23a4564a10a254e15ec5b09978a343265568fb"
+      ROOT_SIZE: ${{ inputs.root_size }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -eux
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            fuse3 \
+            libfuse3-dev \
+            bzip2 \
+            libbz2-dev \
+            zlib1g-dev \
+            cmake \
+            build-essential \
+            git \
+            libattr1-dev \
+            hfsprogs \
+            rsync \
+            unzip \
+            curl \
+            ca-certificates \
+            android-sdk-libsparse-utils
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Build apfs-fuse
+        shell: bash
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/sgan81/apfs-fuse.git "$RUNNER_TEMP/apfs-fuse"
+          cd "$RUNNER_TEMP/apfs-fuse"
+          git submodule update --init --depth 1
+          # Current GCC rejects this header on some Ubuntu toolchains.
+          sed -i '/#include <memory>/a #include <cstdint>' ApfsLib/PList.h
+          mkdir build
+          cd build
+          cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+          command -v apfs-fuse
+          apfs-fuse --help || true
+
+      - name: Download iPhone X iOS 16.7.16 IPSW
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP"
+          curl -L --fail --retry 5 --retry-delay 5 \
+            -o iphone-x-16.7.16.ipsw \
+            "$IPSW_URL"
+          echo "$IPSW_SHA256  iphone-x-16.7.16.ipsw" | sha256sum -c -
+          ls -lh iphone-x-16.7.16.ipsw
+
+      - name: Extract only the three rootfs DMGs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          IPSW="$RUNNER_TEMP/iphone-x-16.7.16.ipsw"
+          OUT="$RUNNER_TEMP/dmgs"
+          mkdir -p "$OUT"
+
+          python3 - "$IPSW" "$OUT" <<'PY'
+          import sys, zipfile, shutil
+          from pathlib import Path
+
+          ipsw = Path(sys.argv[1])
+          out = Path(sys.argv[2])
+
+          targets = {
+              "087-86698-044.dmg": "OS.dmg",
+              "087-86593-047.dmg": "SystemOS.dmg",
+              "087-86715-047.dmg": "AppOS.dmg",
+          }
+
+          found = set()
+
+          with zipfile.ZipFile(ipsw) as z:
+              for info in z.infolist():
+                  name = Path(info.filename).name
+                  if name in targets:
+                      dst = out / targets[name]
+                      print(f"Extracting {info.filename} -> {dst}")
+                      with z.open(info) as src, dst.open("wb") as dstf:
+                          shutil.copyfileobj(src, dstf, length=1024 * 1024)
+                      found.add(name)
+
+          missing = set(targets) - found
+          if missing:
+              raise SystemExit(f"Missing required IPSW files: {sorted(missing)}")
+          PY
+
+          ls -lh "$OUT"
+          # The IPSW is no longer needed and can consume several GB.
+          rm -f "$IPSW"
+          df -h /
+
+      - name: Build HFS+ iOS root image
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p "$RUNNER_TEMP/rootfs"
+          cp tools/mkiosroot.sh "$RUNNER_TEMP/rootfs/"
+          chmod +x "$RUNNER_TEMP/rootfs/mkiosroot.sh"
+
+          cd "$RUNNER_TEMP/rootfs"
+
+          "$RUNNER_TEMP/rootfs/mkiosroot.sh" \
+            "$RUNNER_TEMP/dmgs/OS.dmg" \
+            "$RUNNER_TEMP/dmgs/SystemOS.dmg" \
+            "$RUNNER_TEMP/dmgs/AppOS.dmg" \
+            ios16-root.img \
+            "$ROOT_SIZE"
+
+          ls -lh ios16-root.img
+          du -h ios16-root.img
+          df -h /
+
+      - name: Convert userdata to Android sparse format
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/rootfs"
+
+          img2simg ios16-root.img ios16-root.simg
+
+          echo "=== Images ==="
+          ls -lh ios16-root.img ios16-root.simg
+          echo "=== SHA256 ==="
+          sha256sum ios16-root.img ios16-root.simg
+          echo "=== Sparse header ==="
+          simg_dump ios16-root.simg | head -40 || true
+
+      - name: Upload userdata image
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios16-rootfs-sunstone
+          path: |
+            ${{ runner.temp }}/rootfs/ios16-root.simg
+            ${{ runner.temp }}/rootfs/ios16-root.img
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
