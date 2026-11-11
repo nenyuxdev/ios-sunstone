@@ -159,20 +159,28 @@ jobs:
 
           img2simg ios16-root.img ios16-root.simg
 
-          echo "=== Images ==="
+          echo "=== Images before cleanup ==="
           ls -lh ios16-root.img ios16-root.simg
           echo "=== SHA256 ==="
           sha256sum ios16-root.img ios16-root.simg
           echo "=== Sparse header ==="
           simg_dump ios16-root.simg | head -40 || true
 
+          # Only the sparse image is needed for fastboot flashing.
+          rm -f ios16-root.img
+          rm -rf "$RUNNER_TEMP/dmgs"
+
+          echo "=== Final flashable image ==="
+          ls -lh ios16-root.simg
+          sha256sum ios16-root.simg
+          df -h /
+
       - name: Upload userdata image
         uses: actions/upload-artifact@v4
         with:
           name: ios16-rootfs-sunstone
-          path: |
-            ${{ runner.temp }}/rootfs/ios16-root.simg
-            ${{ runner.temp }}/rootfs/ios16-root.img
+          path: ${{ runner.temp }}/rootfs/ios16-root.simg
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+          
